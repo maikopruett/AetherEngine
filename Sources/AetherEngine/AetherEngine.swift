@@ -729,13 +729,15 @@ public final class AetherEngine: ObservableObject {
         url: URL,
         startPosition: Double? = nil,
         options: LoadOptions = .init(),
-        audioSourceStreamIndex: Int32? = nil
+        audioSourceStreamIndex: Int32? = nil,
+        preopenedDemuxer: Demuxer? = nil
     ) async throws -> SourceProbe? {
         try await load(
             source: .url(url),
             startPosition: startPosition,
             options: options,
-            audioSourceStreamIndex: audioSourceStreamIndex
+            audioSourceStreamIndex: audioSourceStreamIndex,
+            preopenedDemuxer: preopenedDemuxer
         )
     }
 
@@ -766,7 +768,8 @@ public final class AetherEngine: ObservableObject {
         source: MediaSource,
         startPosition: Double? = nil,
         options: LoadOptions = .init(),
-        audioSourceStreamIndex: Int32? = nil
+        audioSourceStreamIndex: Int32? = nil,
+        preopenedDemuxer: Demuxer? = nil
     ) async throws -> SourceProbe? {
         // Preserve the native AVPlayer host across a native->native reload
         // so AVKit's system Now-Playing registration survives the seam
@@ -864,7 +867,13 @@ public final class AetherEngine: ObservableObject {
         var probedAudioTracks: [TrackInfo] = []
         var probedSubtitleTracks: [TrackInfo] = []
         var probedDefaultAudioIndex: Int32 = -1
-        let probe = Demuxer()
+        // A caller can hand in a demuxer it opened ahead of the tap (via
+        // `openDemuxer(url:)`, e.g. during UI hover) so the dominant
+        // `avformat_open_input` + `find_stream_info` cost is already paid.
+        // When present we adopt it as the probe/session demuxer and skip the
+        // open below. The caller is responsible for having opened it with
+        // matching options (httpHeaders/isLive).
+        let probe = preopenedDemuxer ?? Demuxer()
         // Register the in-flight probe so stopInternal can abort it. The
         // probe's avformat_open_input / find_stream_info can block for the
         // AVIOReader's full reconnect budget against a dead live source
@@ -879,7 +888,7 @@ public final class AetherEngine: ObservableObject {
         // already registered ITS probe by the time this one unwinds; an
         // unconditional nil here would strip the successor's abort handle.
         defer { if inFlightProbeDemuxer === probe { inFlightProbeDemuxer = nil } }
-        var probeOpened = false
+        var probeOpened = preopenedDemuxer != nil
         do {
             // Detach the HTTP probe + avformat_open_input + avformat_find_stream_info
             // off the @MainActor so the SwiftUI host stays responsive.
@@ -889,27 +898,29 @@ public final class AetherEngine: ObservableObject {
             // main thread despite the `async` signature — there's no
             // suspension point. `Task.detached.value` introduces a real
             // hop to a background thread so the @MainActor runloop keeps
-            // ticking.
-            try await Task.detached(priority: .userInitiated) { [probe, source, options] in
-                switch source {
-                case .url(let u):
-                    // Pass isLive so the probe demuxer's AVIOReader is
-                    // configured for endless-feed mode. The probe demuxer is
-                    // reused as the session demuxer (avformat_open_input +
-                    // avformat_find_stream_info run only once), so the
-                    // AVIOReader it holds must already have isLive=true when
-                    // the producer starts reading from it.
-                    try probe.open(url: u, extraHeaders: options.httpHeaders, isLive: options.isLive)
-                case .custom(let reader, let formatHint):
-                    // Pass isLive so the probe demuxer suppresses the
-                    // SEEK_END duration estimate on a forward-only live
-                    // reader (same reason as the .url arm above). The probe
-                    // demuxer is reused as the session demuxer, so the live
-                    // flag must be set at open time.
-                    try probe.open(reader: reader, formatHint: formatHint, isLive: options.isLive)
-                }
-            }.value
-            probeOpened = true
+            // ticking. Skipped entirely when a prewarmed demuxer was handed in.
+            if preopenedDemuxer == nil {
+                try await Task.detached(priority: .userInitiated) { [probe, source, options] in
+                    switch source {
+                    case .url(let u):
+                        // Pass isLive so the probe demuxer's AVIOReader is
+                        // configured for endless-feed mode. The probe demuxer is
+                        // reused as the session demuxer (avformat_open_input +
+                        // avformat_find_stream_info run only once), so the
+                        // AVIOReader it holds must already have isLive=true when
+                        // the producer starts reading from it.
+                        try probe.open(url: u, extraHeaders: options.httpHeaders, isLive: options.isLive)
+                    case .custom(let reader, let formatHint):
+                        // Pass isLive so the probe demuxer suppresses the
+                        // SEEK_END duration estimate on a forward-only live
+                        // reader (same reason as the .url arm above). The probe
+                        // demuxer is reused as the session demuxer, so the live
+                        // flag must be set at open time.
+                        try probe.open(reader: reader, formatHint: formatHint, isLive: options.isLive)
+                    }
+                }.value
+                probeOpened = true
+            }
             let videoIdx = probe.videoStreamIndex
             if videoIdx >= 0, let stream = probe.stream(at: videoIdx) {
                 detectedFormat = Self.detectVideoFormat(stream: stream)
