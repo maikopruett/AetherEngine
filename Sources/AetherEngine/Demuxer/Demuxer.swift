@@ -13,10 +13,31 @@ struct DemuxerOpenProfile: Sendable {
     var maxAnalyzeDuration: Int64
     var avioPrefetch: Bool
     var avioChunkSize: Int
+    /// URL opens try `.fastProbe` first and only re-open with this full
+    /// profile when the fast pass left a playable stream without codec
+    /// parameters (see `hasPlayableStreamMissingParameters`).
+    var fastFirstPass: Bool = false
 
     static let playback = DemuxerOpenProfile(
         probesize: 50 * 1024 * 1024,
         maxAnalyzeDuration: 60 * 1_000_000,
+        avioPrefetch: true,
+        avioChunkSize: 4 * 1024 * 1024,
+        fastFirstPass: true
+    )
+
+    /// First pass for `.playback` URL opens: an FFmpeg-default-sized
+    /// budget that parameterizes virtually every real file within a
+    /// couple of chunk reads. Files that legitimately need deep probing
+    /// (sparse PGS/DVB subtitle tracks in big remuxes) escalate to the
+    /// full `.playback` budget at the cost of one extra open (~8 MB +
+    /// reconnect — noise next to the 50 MB those files read anyway).
+    /// What this kills: streams that will NEVER parameterize (malformed
+    /// cover art) burning the entire 50 MB budget over the network —
+    /// ~26 s of dead time before first frame at 15 Mbps.
+    static let fastProbe = DemuxerOpenProfile(
+        probesize: 8 * 1024 * 1024,
+        maxAnalyzeDuration: 5 * 1_000_000,
         avioPrefetch: true,
         avioChunkSize: 4 * 1024 * 1024
     )
@@ -91,14 +112,76 @@ public final class Demuxer: @unchecked Sendable {
     /// error when the reconnect cap is hit (instead of collapsing to a
     /// silent EOF). Has no effect on `file://` sources.
     func open(url: URL, extraHeaders: [String: String] = [:], profile: DemuxerOpenProfile = .playback, isLive: Bool = false) throws {
-        self.openProfile = profile
-        let isHTTP = url.scheme == "http" || url.scheme == "https"
+        let start = ContinuousClock.now
 
+        // Two-phase probe for on-demand URL sources: a fast pass covers
+        // virtually every file; only a playable stream still missing codec
+        // parameters justifies paying for the full-budget re-open. Live
+        // feeds skip the fast pass — a re-open means re-GETting a stream
+        // whose server may restart it from the beginning.
+        if profile.fastFirstPass, !isLive {
+            self.openProfile = .fastProbe
+            try openByScheme(url: url, extraHeaders: extraHeaders, isLive: isLive)
+            guard hasPlayableStreamMissingParameters() else {
+                EngineLog.emit("[Demuxer] open+probe took \(Self.elapsedMs(since: start))ms (fast probe)", category: .demux)
+                return
+            }
+            EngineLog.emit("[Demuxer] fast probe left a playable stream without codec parameters after \(Self.elapsedMs(since: start))ms — re-opening with full probe budget", category: .demux)
+            close()
+        }
+
+        self.openProfile = profile
+        try openByScheme(url: url, extraHeaders: extraHeaders, isLive: isLive)
+        EngineLog.emit("[Demuxer] open+probe took \(Self.elapsedMs(since: start))ms (full budget)", category: .demux)
+    }
+
+    private func openByScheme(url: URL, extraHeaders: [String: String], isLive: Bool) throws {
+        let isHTTP = url.scheme == "http" || url.scheme == "https"
         if isHTTP {
             try openHTTP(url: url, extraHeaders: extraHeaders, isLive: isLive)
         } else {
             try openLocal(url: url)
         }
+    }
+
+    private static func elapsedMs(since start: ContinuousClock.Instant) -> Int {
+        Int((ContinuousClock.now - start) / .milliseconds(1))
+    }
+
+    /// Cover-art image codecs: a "video" stream carrying one of these is
+    /// album/poster art, never playable content.
+    private static let coverArtCodecIDs: Set<UInt32> = [
+        AV_CODEC_ID_PNG.rawValue, AV_CODEC_ID_MJPEG.rawValue, AV_CODEC_ID_BMP.rawValue,
+        AV_CODEC_ID_GIF.rawValue, AV_CODEC_ID_TIFF.rawValue, AV_CODEC_ID_WEBP.rawValue,
+    ]
+
+    /// True when a stream playback actually consumes (real video, audio,
+    /// subtitles) came out of the probe without codec parameters — the
+    /// signal that the budget ran out before reaching its packets (sparse
+    /// PGS subs in big remuxes) and a deeper probe could still help.
+    /// Attached pictures and cover-art video streams can't trigger
+    /// escalation: malformed cover art (e.g. MP4 UDTA art that failed atom
+    /// parsing, which also loses its ATTACHED_PIC disposition) never gets
+    /// parameters no matter how much is read.
+    private func hasPlayableStreamMissingParameters() -> Bool {
+        guard let ctx = formatContext else { return false }
+        for i in 0..<Int(ctx.pointee.nb_streams) {
+            guard let stream = ctx.pointee.streams[i],
+                  let par = stream.pointee.codecpar else { continue }
+            if (stream.pointee.disposition & AV_DISPOSITION_ATTACHED_PIC) != 0 { continue }
+            switch par.pointee.codec_type {
+            case AVMEDIA_TYPE_VIDEO:
+                if Self.coverArtCodecIDs.contains(par.pointee.codec_id.rawValue) { continue }
+                if par.pointee.codec_id == AV_CODEC_ID_NONE || par.pointee.width <= 0 { return true }
+            case AVMEDIA_TYPE_AUDIO:
+                if par.pointee.codec_id == AV_CODEC_ID_NONE || par.pointee.sample_rate <= 0 { return true }
+            case AVMEDIA_TYPE_SUBTITLE:
+                if par.pointee.codec_id == AV_CODEC_ID_NONE { return true }
+            default:
+                continue
+            }
+        }
+        return false
     }
 
     // MARK: - Open Strategies
@@ -197,10 +280,12 @@ public final class Demuxer: @unchecked Sendable {
     /// files (10–20 GB Blu-ray rips) with sparse subtitle streams that
     /// budget runs out before libavformat sees a single PGS / DVB
     /// presentation segment, leaving those tracks with no codec
-    /// parameters and the decoder unable to assemble cues. Bumping
-    /// to 50 MB / 60 s gives the probe enough material without
-    /// noticeably slowing playback start (LAN can move 50 MB in
-    /// well under a second).
+    /// parameters and the decoder unable to assemble cues — hence the
+    /// 50 MB / 60 s `.playback` budget. But "LAN can move 50 MB in well
+    /// under a second" does not hold for remote HTTP sources (debrid
+    /// links at internet speeds), so URL opens run a `.fastProbe` first
+    /// pass and only escalate to the full budget when a playable stream
+    /// actually came up short (see `open(url:)`).
     private func applyProbeBudget(_ ctx: UnsafeMutablePointer<AVFormatContext>) {
         ctx.pointee.probesize = openProfile.probesize
         ctx.pointee.max_analyze_duration = openProfile.maxAnalyzeDuration
