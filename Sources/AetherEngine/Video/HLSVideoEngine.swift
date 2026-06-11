@@ -342,13 +342,18 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Target duration for the FIRST segment of a VOD keyframe-aligned
     /// plan only. Playback can't start until seg0 is fully produced and
     /// fetched, so the bytes in seg0 gate the first frame directly: a
-    /// ~2 s opener halves that gate versus the 4 s steady-state target
-    /// while staying above typical GOP lengths (so the cut usually lands
-    /// on the second or third IRAP, not degenerate single-GOP slivers).
+    /// ~2 s opener halves that gate versus the 4 s steady-state target.
     /// Steady-state segments stay at `targetSegmentDuration`; HLS allows
     /// variable segment durations (EXTINF ≤ TARGETDURATION is the only
     /// constraint, and a SHORTER first segment can't violate it).
-    static let firstSegmentTargetDuration: Double = 2.0
+    ///
+    /// 1.5, not 2.0: the cut lands on the first IRAP at-or-after this
+    /// threshold, and ~2 s GOPs are extremely common — at 2.0 a source
+    /// with 2.002 s GOPs misses its ~1.95 s keyframe by a frame and the
+    /// opener balloons to two GOPs (measured: Futurama S1E2 720p MP4 cut
+    /// seg0 at 4.004 s). 1.5 catches the first ~2 s keyframe while still
+    /// skipping degenerate sub-1.5 s slivers.
+    static let firstSegmentTargetDuration: Double = 1.5
 
     // MARK: - Measurement spike: sliding-window prototype (superseded)
     //
