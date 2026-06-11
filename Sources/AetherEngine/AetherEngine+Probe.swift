@@ -64,44 +64,6 @@ extension AetherEngine {
         return makeSourceProbe(demuxer: demuxer, displayURL: displayURL)
     }
 
-    // MARK: - Demuxer prewarm
-
-    /// Open (and stream-info probe) a demuxer for `url` WITHOUT starting a
-    /// playback session, so the expensive `avformat_open_input` +
-    /// `find_stream_info` round-trips — the dominant tap-to-first-frame cost
-    /// on slow CDN links — can run AHEAD of the play tap (e.g. during UI
-    /// hover/focus dwell). Hand the result to
-    /// `load(url:preopenedDemuxer:)` on tap and the engine adopts it,
-    /// skipping the open entirely.
-    ///
-    /// Ownership: the caller owns the returned demuxer until it either
-    /// passes it to `load(preopenedDemuxer:)` (which adopts and eventually
-    /// closes it) or calls `discardDemuxer(_:)`. Dropping the reference also
-    /// closes it (deinit), but `discardDemuxer` aborts promptly.
-    ///
-    /// Open it with the SAME `options` the eventual `load` will use
-    /// (`httpHeaders`, `isLive`): the demuxer is reused as the session
-    /// demuxer, so its AVIOReader must already be configured to match. This
-    /// call blocks on network I/O — run it off the main actor.
-    public nonisolated static func openDemuxer(
-        url: URL,
-        options: LoadOptions = .init()
-    ) throws -> Demuxer {
-        let demuxer = Demuxer()
-        try demuxer.open(url: url, extraHeaders: options.httpHeaders, isLive: options.isLive)
-        return demuxer
-    }
-
-    /// Abort and free a demuxer returned by `openDemuxer(url:)` that will
-    /// NOT be handed to `load` (the tap never came, a newer prewarm
-    /// superseded it, the user backed out). `markClosed()` unblocks an open
-    /// still in flight immediately; `close()` frees the context. Safe to
-    /// call from any thread, idempotent.
-    public nonisolated static func discardDemuxer(_ demuxer: Demuxer) {
-        demuxer.markClosed()
-        demuxer.close()
-    }
-
     /// Assemble a `SourceProbe` from an open demuxer. Shared by the
     /// static probe entry points and `load(source:)`'s internal probe
     /// stage, so all of them report identical metadata for the same
