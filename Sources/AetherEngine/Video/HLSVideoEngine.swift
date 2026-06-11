@@ -339,6 +339,17 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// larger playlist footprint is negligible.
     static let targetSegmentDuration: Double = 4.0
 
+    /// Target duration for the FIRST segment of a VOD keyframe-aligned
+    /// plan only. Playback can't start until seg0 is fully produced and
+    /// fetched, so the bytes in seg0 gate the first frame directly: a
+    /// ~2 s opener halves that gate versus the 4 s steady-state target
+    /// while staying above typical GOP lengths (so the cut usually lands
+    /// on the second or third IRAP, not degenerate single-GOP slivers).
+    /// Steady-state segments stay at `targetSegmentDuration`; HLS allows
+    /// variable segment durations (EXTINF ≤ TARGETDURATION is the only
+    /// constraint, and a SHORTER first segment can't violate it).
+    static let firstSegmentTargetDuration: Double = 2.0
+
     // MARK: - Measurement spike: sliding-window prototype (superseded)
     //
     // PRODUCTIZED (Task B3): the throwaway `_liveSlidingPrototype` flag and

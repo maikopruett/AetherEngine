@@ -87,6 +87,15 @@ final class NativeAVPlayerHost {
     private var notificationObservers: [NSObjectProtocol] = []
     private var accessLogCount = 0
 
+    /// Startup-gate kick (VOD loopback only, see `load(kickStartOnFirstFrame:)`).
+    /// Whether this session may bypass AVPlayer's conservative start
+    /// evaluation once the first frame is displayable.
+    private var kickStartOnFirstFrame = false
+    /// One-shot latch: the kick fires at most once per load(). Without it
+    /// a mid-session rebuffer (a genuine upstream stall) would also get
+    /// kicked, defeating AVPlayer's stall handling.
+    private var didKickStart = false
+
     /// Monotonic counter so multi-attempt sessions (DrHurt-style
     /// "play, fail, back out, retry") produce distinguishable log
     /// lines. Every load(url:) increments it; every async asset.load
@@ -128,8 +137,23 @@ final class NativeAVPlayerHost {
     /// `DisplayCriteriaController.apply(...)` must have been invoked
     /// upstream so AVKit can configure the HDR pipeline against the
     /// right target mode before the first segment is fetched.
-    func load(url: URL, startPosition: Double?, perFrameHDR: Bool = true, skipInitialSeek: Bool = false, forwardBufferDuration: Double = 4.0) {
+    /// `kickStartOnFirstFrame`: when true, the host calls
+    /// `playImmediately(atRate:)` the first time the player layer reports
+    /// `isReadyForDisplay` while AVPlayer is still parked in
+    /// `waitingToPlayAtSpecifiedRate`. Against the loopback VOD server
+    /// AVPlayer's start heuristics (`evaluatingBufferingRate` /
+    /// `toMinimizeStalls`) add ~1-1.5 s of latency without adding safety:
+    /// the local origin delivers exactly as fast as the upstream link, so
+    /// once a frame is decodable the wait buys nothing. The kick is a
+    /// ONE-SHOT that leaves `automaticallyWaitsToMinimizeStalling` at its
+    /// default `true`, so mid-session rebuffers keep AVPlayer's normal
+    /// stall handling. (Setting `automaticallyWaits...=false` globally was
+    /// tried and permanently stalled startup — see the init() note.)
+    /// Default false; only the VOD loopback path opts in. Live paths keep
+    /// the buffer-paced start (the transcode warm-up gap needs it).
+    func load(url: URL, startPosition: Double?, perFrameHDR: Bool = true, skipInitialSeek: Bool = false, forwardBufferDuration: Double = 4.0, kickStartOnFirstFrame: Bool = false) {
         unloadCurrentItem()
+        self.kickStartOnFirstFrame = kickStartOnFirstFrame
 
         Self.nextSessionID += 1
         sessionID = Self.nextSessionID
@@ -139,15 +163,24 @@ final class NativeAVPlayerHost {
 
         EngineLog.emit("[NativeAVPlayerHost] #\(sid) load url=\(url.absoluteString) startPos=\(startPosition.map { String(format: "%.2fs", $0) } ?? "nil")", category: .engine)
 
-        // First-frame-visible diagnostic (see `layerReadyObservation`).
+        // First-frame-visible diagnostic (see `layerReadyObservation`),
+        // and the trigger for the one-shot startup kick: the layer going
+        // ready means seg0 is fetched and the first frame is decoded, so
+        // any remaining waitingToPlay time is pure heuristic latency.
         layerReadyObservation = playerLayer.observe(
             \.isReadyForDisplay, options: [.new, .initial]
-        ) { layer, change in
+        ) { [weak self] layer, change in
+            let ready = change.newValue ?? layer.isReadyForDisplay
             let elapsed = Double(DispatchTime.now().uptimeNanoseconds - loadStart.uptimeNanoseconds) / 1_000_000_000
             EngineLog.emit(
-                "[NativeAVPlayerHost] #\(sid) layer.isReadyForDisplay=\(change.newValue ?? layer.isReadyForDisplay) t+\(String(format: "%.2f", elapsed))s",
+                "[NativeAVPlayerHost] #\(sid) layer.isReadyForDisplay=\(ready) t+\(String(format: "%.2f", elapsed))s",
                 category: .engine
             )
+            if ready {
+                Task { @MainActor in
+                    self?.kickStartIfWarranted(sid: sid, trigger: "layerReady")
+                }
+            }
         }
 
         let asset = AVURLAsset(url: url)
@@ -378,6 +411,15 @@ final class NativeAVPlayerHost {
             Task { @MainActor in
                 guard let self = self else { return }
                 self.timeControlStatus = status
+                // Second kick trigger, covering the opposite ordering from
+                // the layer-ready observer: the layer can go ready while the
+                // player is still parked pre-play() (rate 0), in which case
+                // the layer KVO fired too early and never re-fires. When the
+                // explicit play() then lands the player in waitingToPlay,
+                // this picks the kick up.
+                if status == .waitingToPlayAtSpecifiedRate {
+                    self.kickStartIfWarranted(sid: sid, trigger: "waitingToPlay")
+                }
                 // On the first real .playing transition, re-sample the
                 // audio route after a short settle delay: AVKit negotiates
                 // the HDMI output format (stereo -> source channel count /
@@ -593,6 +635,27 @@ final class NativeAVPlayerHost {
         avPlayer.pause()
     }
 
+    /// One-shot startup kick (see `load(kickStartOnFirstFrame:)`). Fires
+    /// only when ALL of: the session opted in, the kick hasn't fired yet,
+    /// the first frame is actually displayable, and AVPlayer is parked in
+    /// its pre-start buffering evaluation. The `waitingToPlayAtSpecifiedRate`
+    /// guard doubles as the explicit-play() gate: a paused player (engine
+    /// hasn't called play() yet, e.g. mid display-criteria handshake) is
+    /// never kicked.
+    private func kickStartIfWarranted(sid: Int, trigger: String) {
+        guard kickStartOnFirstFrame, !didKickStart else { return }
+        guard playerLayer.isReadyForDisplay else { return }
+        guard avPlayer.timeControlStatus == .waitingToPlayAtSpecifiedRate else { return }
+        didKickStart = true
+        let reason = avPlayer.reasonForWaitingToPlay?.rawValue ?? "-"
+        let elapsed = Double(DispatchTime.now().uptimeNanoseconds - loadStartTime.uptimeNanoseconds) / 1_000_000_000
+        EngineLog.emit(
+            "[NativeAVPlayerHost] #\(sid) kick-start: first frame displayable, bypassing start gate (was \(reason)) t+\(String(format: "%.2f", elapsed))s (\(trigger))",
+            category: .engine
+        )
+        avPlayer.playImmediately(atRate: 1.0)
+    }
+
     func seek(to seconds: Double) {
         let target = CMTime(seconds: seconds, preferredTimescale: 600)
         // Frame-accurate seek. Earlier experiment with
@@ -668,6 +731,10 @@ final class NativeAVPlayerHost {
         // this reused host (episode 2+ of a binge otherwise silently
         // lost the issue-24 downmix warnings).
         didSampleSettledRoute = false
+        // Re-arm the startup kick for the next load on this reused host
+        // (load() sets kickStartOnFirstFrame per session).
+        didKickStart = false
+        kickStartOnFirstFrame = false
         // Force the player rate to 0 before swapping the item. On a
         // native->native reload the host (and its AVPlayer) is reused to
         // keep AVKit's system Now-Playing registration alive (issue #15),

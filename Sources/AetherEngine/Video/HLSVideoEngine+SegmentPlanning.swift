@@ -57,11 +57,18 @@ extension HLSVideoEngine {
 
     /// Build a segment plan from real keyframes using libavformat's
     /// hls muxer cut algorithm: segment N ends at the first keyframe
-    /// whose absolute distance from `start_pts` reaches `(N+1) *
-    /// targetSegmentDuration`. `start_pts` is taken as the first
+    /// whose absolute distance from `start_pts` reaches the segment's
+    /// cumulative duration threshold. `start_pts` is taken as the first
     /// keyframe in the index (sorted ascending), which matches the
     /// muxer's behaviour of latching `vs->start_pts` to the first
     /// packet's pts.
+    ///
+    /// Segment 0 uses the shorter `firstSegmentTargetDuration` so the
+    /// first frame is gated on fewer bytes (see that constant's doc);
+    /// every later segment advances by `targetSegmentDuration`. The
+    /// producer cuts VOD segments at exactly these planned boundaries
+    /// (`segmentBoundaries` in `HLSSegmentProducer`), so the playlist
+    /// and the actual cuts can't drift.
     ///
     /// This algorithm replaces the previous one which walked the
     /// keyframe list with a relative threshold per segment. The
@@ -91,7 +98,8 @@ extension HLSVideoEngine {
         while i < sorted.count {
             let segStartPts = sorted[i]
             let segStartSeconds = Double(segStartPts - startPts0) * tb
-            let thresholdSeconds = Double(segIdx + 1) * target
+            // Cumulative cut threshold: short opener, uniform afterwards.
+            let thresholdSeconds = Self.firstSegmentTargetDuration + Double(segIdx) * target
 
             var j = i + 1
             while j < sorted.count {

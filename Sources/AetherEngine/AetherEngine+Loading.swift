@@ -419,7 +419,12 @@ extension AetherEngine {
         // startup pause far worse (8-10 s) than the 4 s default (~1 s).
         host.load(url: playbackURL,
                   startPosition: startPosition,
-                  perFrameHDR: true)
+                  perFrameHDR: true,
+                  // VOD only: bypass AVPlayer's start-gate heuristics once
+                  // the first frame is displayable. Live keeps the
+                  // buffer-paced start — kicking a live session early makes
+                  // it hit the transcode warm-up gap at the edge head-on.
+                  kickStartOnFirstFrame: !isLive)
     }
 
     /// Open a `SoftwarePlaybackHost` against the source and wire its
