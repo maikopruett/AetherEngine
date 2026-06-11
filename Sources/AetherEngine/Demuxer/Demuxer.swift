@@ -26,17 +26,22 @@ struct DemuxerOpenProfile: Sendable {
         fastFirstPass: true
     )
 
-    /// First pass for `.playback` URL opens: an FFmpeg-default-sized
-    /// budget that parameterizes virtually every real file within a
-    /// couple of chunk reads. Files that legitimately need deep probing
-    /// (sparse PGS/DVB subtitle tracks in big remuxes) escalate to the
-    /// full `.playback` budget at the cost of one extra open (~8 MB +
-    /// reconnect — noise next to the 50 MB those files read anyway).
-    /// What this kills: streams that will NEVER parameterize (malformed
-    /// cover art) burning the entire 50 MB budget over the network —
-    /// ~26 s of dead time before first frame at 15 Mbps.
+    /// First pass for `.playback` URL opens. Sizing logic: well-formed
+    /// MP4/MKV files carry codec parameters in their headers, so
+    /// find_stream_info exits long before ANY budget — the budget is
+    /// only ever spent in full on streams that can't parameterize, which
+    /// makes probesize the exact per-play cost of a malformed stream
+    /// (e.g. broken cover art: 8 MB ≈ 5.7 s at 12 Mbps, measured; 2 MB
+    /// ≈ 1.4 s). Files that legitimately need deep probing (sparse
+    /// PGS/DVB subtitle tracks, TS containers) escalate to the full
+    /// `.playback` budget — one extra open + 2 MB, noise next to the
+    /// 50 MB those files read anyway. analyzeDuration stays at 5 s of
+    /// content so frame-rate estimation keeps enough material; for
+    /// packet-less streams it never binds (probesize does).
+    /// avioChunkSize matches `.playback` because the fast-pass reader
+    /// stays live for the whole session when no escalation happens.
     static let fastProbe = DemuxerOpenProfile(
-        probesize: 8 * 1024 * 1024,
+        probesize: 2 * 1024 * 1024,
         maxAnalyzeDuration: 5 * 1_000_000,
         avioPrefetch: true,
         avioChunkSize: 4 * 1024 * 1024
