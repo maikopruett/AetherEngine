@@ -349,11 +349,57 @@ public final class Demuxer: @unchecked Sendable {
         }
     }
 
+    /// Mark cover-art / attached-picture streams `AVDISCARD_ALL` before
+    /// `find_stream_info`, so libavformat doesn't try to parameterize them.
+    ///
+    /// This is the fix for the dominant startup cost on tagged MP4s: a
+    /// broken PNG cover-art stream (no width/height in its sample entry,
+    /// its single packet effectively unreachable) can NEVER be
+    /// parameterized, so `find_stream_info` reads packets until it hits the
+    /// probe budget — 2 MB of sequential RD range-reads, ~1.4–5 s, measured
+    /// as ~75% of tap-to-video on Futurama S1E2. The real audio/video
+    /// streams are fully described by the moov the instant open returns;
+    /// the cover-art stream is the only thing keeping the analysis loop
+    /// alive. Discarding it lets `find_stream_info` return as soon as the
+    /// real streams are satisfied (near-instant for header-complete MP4),
+    /// while the two-phase escalation still covers files that legitimately
+    /// need deep probing (sparse PGS subs, TS — neither carries cover art).
+    ///
+    /// Identified by codec_id (reliable: the moov sample entry already
+    /// reads `png`/`mjpeg`/… at this point, even when the malformed-atom
+    /// case has lost its ATTACHED_PIC disposition) plus the disposition
+    /// flag (covers well-formed art). Discarded streams keep their index,
+    /// so index-based selection elsewhere is unaffected; av_read_frame
+    /// simply never yields their packets — which is what the muxer wants,
+    /// it never carries cover art into the HLS output.
+    @discardableResult
+    private func discardCoverArtStreams(_ ctx: UnsafeMutablePointer<AVFormatContext>) -> Int {
+        var discarded = 0
+        for i in 0..<Int(ctx.pointee.nb_streams) {
+            guard let stream = ctx.pointee.streams[i],
+                  let par = stream.pointee.codecpar else { continue }
+            let isAttachedPic = (stream.pointee.disposition & AV_DISPOSITION_ATTACHED_PIC) != 0
+            let isImageCodec = par.pointee.codec_type == AVMEDIA_TYPE_VIDEO
+                && Self.coverArtCodecIDs.contains(par.pointee.codec_id.rawValue)
+            guard isAttachedPic || isImageCodec else { continue }
+            stream.pointee.discard = AVDISCARD_ALL
+            discarded += 1
+        }
+        return discarded
+    }
+
     /// Common stream probing after open.
     private func probeStreams(_ ctx: UnsafeMutablePointer<AVFormatContext>) throws {
+        // Stop broken cover-art streams from dragging find_stream_info to
+        // the probe budget (the dominant tagged-MP4 startup cost).
+        let discardedArt = discardCoverArtStreams(ctx)
+
         let findRet = avformat_find_stream_info(ctx, nil)
         guard findRet >= 0 else {
             throw DemuxerError.streamInfoFailed(code: findRet)
+        }
+        if discardedArt > 0 {
+            EngineLog.emit("[Demuxer] discarded \(discardedArt) cover-art stream(s) before probe", category: .demux)
         }
 
         #if DEBUG
