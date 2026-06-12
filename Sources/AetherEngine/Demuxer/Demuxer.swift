@@ -90,6 +90,16 @@ public final class Demuxer: @unchecked Sendable {
     /// budget in `applyProbeBudget` and (in a later task) AVIO tuning.
     private var openProfile: DemuxerOpenProfile = .playback
 
+    /// Skip MKV attachment payloads on network opens (default), where
+    /// fetching them costs real time; local files read them for free and
+    /// keep embedded-font subtitle styling. Tests override to exercise
+    /// both paths against local fixtures.
+    var skipAttachmentsOverride: Bool?
+
+    private func shouldSkipAttachments(networkSource: Bool) -> Bool {
+        skipAttachmentsOverride ?? networkSource
+    }
+
     /// Cumulative bytes fetched by the AVIO reader since the source
     /// was opened. Used by the engine's memory probe to compare
     /// network throughput against RSS growth. Zero for `file://`
@@ -214,7 +224,7 @@ public final class Demuxer: @unchecked Sendable {
 
         let urlString = url.isFileURL ? url.path : url.absoluteString
         var opts: OpaquePointer? = nil
-        Self.applyDemuxerOptions(&opts)
+        Self.applyDemuxerOptions(&opts, skipAttachments: shouldSkipAttachments(networkSource: false))
         let ret = avformat_open_input(&ctx, urlString, nil, &opts)
         av_dict_free(&opts)
         guard ret == 0, let openedCtx = ctx else {
@@ -247,7 +257,8 @@ public final class Demuxer: @unchecked Sendable {
             prefetchEnabled: openProfile.avioPrefetch,
             isLive: isLive
         )
-        try openWithProvider(reader, isLive: isLive)
+        try openWithProvider(reader, isLive: isLive,
+                             skipAttachments: shouldSkipAttachments(networkSource: true))
     }
 
     /// Shared open path for AVIO-backed sources. Opens the provider,
@@ -259,7 +270,8 @@ public final class Demuxer: @unchecked Sendable {
     private func openWithProvider(
         _ provider: AVIOProvider,
         inputFormat: UnsafePointer<AVInputFormat>? = nil,
-        isLive: Bool = false
+        isLive: Bool = false,
+        skipAttachments: Bool = false
     ) throws {
         // 1. Open the provider (HEAD probe for HTTP, alloc context for custom).
         try provider.open()
@@ -286,7 +298,7 @@ public final class Demuxer: @unchecked Sendable {
         // 3. Open input, URL is nil because pb is already set.
         var ctxPtr: UnsafeMutablePointer<AVFormatContext>? = ctx
         var opts: OpaquePointer? = nil
-        Self.applyDemuxerOptions(&opts, isLive: isLive)
+        Self.applyDemuxerOptions(&opts, isLive: isLive, skipAttachments: skipAttachments)
         let ret = avformat_open_input(&ctxPtr, nil, inputFormat, &opts)
         av_dict_free(&opts)
         guard ret == 0 else {
@@ -353,8 +365,22 @@ public final class Demuxer: @unchecked Sendable {
     ///                       reverted to avoid carrying an option that
     ///                       doesn't change behaviour. See
     ///                       [[project_matroska_nopts_dts]].
-    private static func applyDemuxerOptions(_ opts: inout OpaquePointer?, isLive: Bool = false) {
+    private static func applyDemuxerOptions(_ opts: inout OpaquePointer?, isLive: Bool = false,
+                                            skipAttachments: Bool = false) {
         av_dict_set(&opts, "fflags", "+genpts", 0)
+        if skipAttachments {
+            // Patched matroska demuxer option (FFmpegBuild
+            // 0001-matroska-skip-attachments-option): the Attachments
+            // element is skipped in ONE forward jump — a remux can carry
+            // tens of MB of fonts/cover art between the header and the
+            // first cluster, and reading them dominates
+            // avformat_open_input over a CDN (observed: 31.6 MB ≈ 30 s on
+            // RD). The skip surfaces to the AVIOReader as a far forward
+            // seek, which reconnects past the blob instead of streaming
+            // it. Attached-font subtitle styling falls back to system
+            // fonts for these sources. No-op for non-Matroska demuxers.
+            av_dict_set(&opts, "skip_attachments", "1", 0)
+        }
         if isLive {
             // A live HTTP source has unknown length (Content-Length absent,
             // fileSize == -1). libavformat's stream-info pass still tries to

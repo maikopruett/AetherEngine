@@ -25,7 +25,11 @@ let package = Package(
         // No network stack — we use custom AVIO + URLSession for HTTP streams.
         // Resolved over Git rather than a local path so consumers (and
         // Xcode Cloud) can build without a sibling FFmpegBuild checkout.
-        .package(url: "https://github.com/superuser404notfound/FFmpegBuild", branch: "main"),
+        // Fork: carries the matroska skip_attachments patch
+        // (Patches/0001-matroska-skip-attachments-option.patch) so network
+        // opens of attachment-heavy MKVs don't stream tens of MB of fonts
+        // before the first cluster.
+        .package(url: "https://github.com/maikopruett/FFmpegBuild", branch: "main"),
     ],
     targets: [
         .target(

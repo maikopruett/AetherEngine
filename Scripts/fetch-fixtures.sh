@@ -81,6 +81,20 @@ ffmpeg -hide_banner -loglevel error -y \
     -t 5 -c:v libvpx-vp9 -crf 30 -b:v 0 -cpu-used 8 \
     "$FIXTURES_DIR/vp9.webm"
 
+# MKV with font attachments — exercises the patched matroska demuxer's
+# skip_attachments option (the payload bytes are random; only the
+# mimetype matters for classification).
+echo "→ attachments.mkv (H.264 + 2 font attachments)"
+head -c 65536 /dev/urandom > "$FIXTURES_DIR/.fake-font-a.ttf"
+head -c 65536 /dev/urandom > "$FIXTURES_DIR/.fake-font-b.ttf"
+ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "testsrc2=size=320x180:rate=24" \
+    -t 2 -c:v libx264 -preset ultrafast -pix_fmt yuv420p \
+    -attach "$FIXTURES_DIR/.fake-font-a.ttf" -metadata:s:t:0 mimetype=font/ttf \
+    -attach "$FIXTURES_DIR/.fake-font-b.ttf" -metadata:s:t:1 mimetype=font/ttf \
+    "$FIXTURES_DIR/attachments.mkv"
+rm -f "$FIXTURES_DIR/.fake-font-a.ttf" "$FIXTURES_DIR/.fake-font-b.ttf"
+
 echo ""
 echo "Done. Try:"
 echo "  swift run aetherctl probe $FIXTURES_DIR/sdr-h264.mp4"
