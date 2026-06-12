@@ -134,6 +134,14 @@ public final class AetherEngine: ObservableObject {
     /// does NOT fire on telemetry samples).
     public var liveTelemetry: LiveTelemetry? { diagnostics.liveTelemetry }
 
+    /// Per-file derived open state from the current native VOD session
+    /// (see `DemuxPlan`). Available once `load` returns; hosts persist it
+    /// keyed by their file identity (e.g. infoHash + file index) and pass
+    /// it back via `load(demuxPlan:)` on replay/resume to skip the cue
+    /// prewarm round-trips and segment-plan build. nil on the software
+    /// path, live sessions, and sources without a probed byte size.
+    public var currentDemuxPlan: DemuxPlan? { nativeVideoSession?.producedDemuxPlan }
+
     /// Human-readable identity of the video decoder currently in use,
     /// suitable for a "stats for nerds" UI. Examples:
     /// - `"VideoToolbox HEVC (HW)"` for the native AVPlayer path on
@@ -723,6 +731,10 @@ public final class AetherEngine: ObservableObject {
     ///     "default-language audio plus black frame" at session start).
     ///     Validated against the container; an invalid index falls back
     ///     to the auto pick.
+    ///   - demuxPlan: Cached per-file derived state from a previous open
+    ///     of the byte-identical file (see `DemuxPlan`). Validated against
+    ///     the fresh open before use; read `currentDemuxPlan` after load
+    ///     to persist a plan for next time.
     /// Load media from a URL. Convenience wrapper over `load(source:)`.
     @discardableResult
     public func load(
@@ -730,14 +742,16 @@ public final class AetherEngine: ObservableObject {
         startPosition: Double? = nil,
         options: LoadOptions = .init(),
         audioSourceStreamIndex: Int32? = nil,
-        preopenedDemuxer: Demuxer? = nil
+        preopenedDemuxer: Demuxer? = nil,
+        demuxPlan: DemuxPlan? = nil
     ) async throws -> SourceProbe? {
         try await load(
             source: .url(url),
             startPosition: startPosition,
             options: options,
             audioSourceStreamIndex: audioSourceStreamIndex,
-            preopenedDemuxer: preopenedDemuxer
+            preopenedDemuxer: preopenedDemuxer,
+            demuxPlan: demuxPlan
         )
     }
 
@@ -769,7 +783,8 @@ public final class AetherEngine: ObservableObject {
         startPosition: Double? = nil,
         options: LoadOptions = .init(),
         audioSourceStreamIndex: Int32? = nil,
-        preopenedDemuxer: Demuxer? = nil
+        preopenedDemuxer: Demuxer? = nil,
+        demuxPlan: DemuxPlan? = nil
     ) async throws -> SourceProbe? {
         // Preserve the native AVPlayer host across a native->native reload
         // so AVKit's system Now-Playing registration survives the seam
@@ -1006,6 +1021,27 @@ public final class AetherEngine: ObservableObject {
         let sourceProbe: SourceProbe? = probeOpened
             ? Self.makeSourceProbe(demuxer: probe, displayURL: url)
             : nil
+        // Preferred-language resolution: when the host passed no explicit
+        // stream override, map LoadOptions.preferredAudioLanguage onto the
+        // probed track list here — the one point where every load path has
+        // the full language-labeled track inventory. From here on the
+        // language pick IS the override, so it flows through the native /
+        // software dispatch below exactly like a host-passed index.
+        let audioSourceStreamIndex: Int32? = {
+            if let explicit = audioSourceStreamIndex { return explicit }
+            guard let preferred = options.preferredAudioLanguage else { return nil }
+            let override = Self.audioStreamOverride(
+                preferredLanguage: preferred,
+                tracks: probedAudioTracks,
+                defaultIndex: probedDefaultAudioIndex)
+            if let override {
+                EngineLog.emit(
+                    "[AetherEngine] audio: preferredAudioLanguage=\(preferred) resolved to sourceStreamIndex=\(override) (default \(probedDefaultAudioIndex) is other-language)",
+                    category: .engine)
+            }
+            return override
+        }()
+
         // Mirror the audio stream HLSVideoEngine will actually pick.
         // When the host passed an override, that takes precedence; if
         // the override is invalid we fall back to the auto pick to
@@ -1281,6 +1317,7 @@ public final class AetherEngine: ObservableObject {
                     isLive: options.isLive,
                     dvrWindowSeconds: options.dvrWindowSeconds,
                     preopenedDemuxer: probeOpened ? probe : nil,
+                    demuxPlan: demuxPlan,
                     generation: gen
                 )
                 playbackBackend = .native

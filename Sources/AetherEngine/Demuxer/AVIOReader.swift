@@ -73,6 +73,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private var position: Int64 = 0
     private var fileSize: Int64 = -1
 
+    /// Source byte size learned by the open's Range/HEAD probe; -1 when
+    /// unknown (streaming/live). Surfaced through `Demuxer.sourceFileSize`
+    /// for DemuxPlan byte-identity validation.
+    var probedFileSize: Int64 { fileSize }
+
     /// Final URL after the first request's redirect chain resolved.
     /// Used for subsequent Range / probe fetches so we skip the proxy
     /// → CDN redirect hop on every chunk. Nil until a request
@@ -1423,7 +1428,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// pool warm and the fingerprint stable. Distinct from `syncRequest`'s
     /// per-request session pattern, which is load-bearing for chunk-fetch
     /// leak control but adds no benefit to a one-byte probe.
-    private static let probeSession: URLSession = {
+    ///
+    /// Internal (not private): exposed to hosts through
+    /// `AetherEngine.sourceProbeSession` so pre-flight availability reads
+    /// can share this pool — see that property's doc.
+    static let probeSession: URLSession = {
         let config = URLSessionConfiguration.default
         config.urlCache = nil
         config.timeoutIntervalForRequest = 20

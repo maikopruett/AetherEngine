@@ -218,6 +218,21 @@ public struct LoadOptions: Sendable, Equatable {
     /// bitmap tracks are untouched. Default `false` (AetherEngine#30).
     public var preserveASSMarkup: Bool
 
+    /// Preferred audio language (ISO 639-1 or 639-2 code, e.g. "en" /
+    /// "eng"). When set and `audioSourceStreamIndex` is nil, the engine
+    /// resolves the override itself during load — no separate
+    /// `probe(url:)` pass (a full second container open on network
+    /// sources) just to map a language to a stream index.
+    ///
+    /// Conservative on purpose, matching the multi-language-release
+    /// heuristic: the pick only diverts from the container's default
+    /// track when that default is EXPLICITLY labeled a different
+    /// language and a track matching the preference exists. Unlabeled
+    /// defaults stay — they're most often correct on single-language
+    /// releases. An explicit `audioSourceStreamIndex` always wins.
+    /// Default nil (container default).
+    public var preferredAudioLanguage: String?
+
     public init(
         omitCriteriaColorExtensions: Bool = false,
         suppressDisplayCriteria: Bool = false,
@@ -230,7 +245,8 @@ public struct LoadOptions: Sendable, Equatable {
         audioOnly: Bool = false,
         dvrWindowSeconds: Double? = nil,
         nativeRemoteHLS: Bool = false,
-        preserveASSMarkup: Bool = false
+        preserveASSMarkup: Bool = false,
+        preferredAudioLanguage: String? = nil
     ) {
         self.omitCriteriaColorExtensions = omitCriteriaColorExtensions
         self.suppressDisplayCriteria = suppressDisplayCriteria
@@ -244,6 +260,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.dvrWindowSeconds = dvrWindowSeconds
         self.nativeRemoteHLS = nativeRemoteHLS
         self.preserveASSMarkup = preserveASSMarkup
+        self.preferredAudioLanguage = preferredAudioLanguage
     }
 }
 

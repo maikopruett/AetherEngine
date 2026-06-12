@@ -458,7 +458,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         dvrWindowSeconds: Double? = nil,
         liveSourceCadenceHint: Double? = nil,
         preopenedDemuxer: Demuxer? = nil,
-        sourceReopenableByURL: Bool = true
+        sourceReopenableByURL: Bool = true,
+        demuxPlan: DemuxPlan? = nil
     ) {
         self.sourceURL = url
         self.sourceHTTPHeaders = sourceHTTPHeaders
@@ -488,6 +489,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.liveTargetDurationFloorSeconds = liveSourceCadenceHint.map { ceil($0) }
         self.preopenedDemuxer = preopenedDemuxer
         self.sourceReopenableByURL = sourceReopenableByURL
+        self.demuxPlan = demuxPlan
     }
 
     /// Whether this engine is serving an unbounded (live) source. Set
@@ -550,6 +552,19 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// linger after the engine is torn down.
     private var preopenedDemuxer: Demuxer?
 
+    /// Candidate cached plan from a previous open of (what the host
+    /// believes is) the same file. `start()` validates it against the
+    /// fresh open's probed byte size + duration before trusting it; a
+    /// mismatch silently falls back to the normal prewarm + plan build.
+    private let demuxPlan: DemuxPlan?
+
+    /// The plan derived by this session's `start()` (built fresh or the
+    /// validated cached one), in serializable form. Hosts read this after
+    /// `load` returns and persist it keyed by file identity, then pass it
+    /// back via `load(demuxPlan:)` on replay/resume. nil for live
+    /// sessions and before `start()` completes.
+    private(set) var producedDemuxPlan: DemuxPlan?
+
     /// Resume position used to seed the sliding-window playlist so its
     /// initial visible range covers the segment AVPlayer will seek to.
     /// Without this seed, a resume at e.g. 4368 s lands AVPlayer on a
@@ -558,6 +573,38 @@ public final class HLSVideoEngine: @unchecked Sendable {
     private let initialPositionSeconds: Double?
 
     // MARK: - Public API
+
+    /// Accept the init-supplied `DemuxPlan` only when the freshly opened
+    /// source proves byte-identical: probed file size matches exactly and
+    /// the container duration agrees (loose epsilon — duration is derived,
+    /// size is the real key). Any mismatch logs and returns nil, dropping
+    /// the open back to the normal prewarm + plan build, so a stale cache
+    /// entry can only cost the time it would have saved — never a wrong
+    /// timeline.
+    private func validatedDemuxPlan(for dem: Demuxer, durationSeconds: Double) -> DemuxPlan? {
+        guard let candidate = demuxPlan else { return nil }
+        guard candidate.formatVersion == DemuxPlan.currentFormatVersion else {
+            EngineLog.emit(
+                "[HLSVideoEngine] cached DemuxPlan ignored: formatVersion \(candidate.formatVersion) != \(DemuxPlan.currentFormatVersion)",
+                category: .session)
+            return nil
+        }
+        let probedSize = dem.sourceFileSize
+        guard candidate.fileSize > 0, probedSize > 0, candidate.fileSize == probedSize else {
+            EngineLog.emit(
+                "[HLSVideoEngine] cached DemuxPlan ignored: fileSize \(candidate.fileSize) vs probed \(probedSize) — source bytes changed, full open",
+                category: .session)
+            return nil
+        }
+        guard !candidate.segments.isEmpty,
+              abs(candidate.durationSeconds - durationSeconds) < 1.0 else {
+            EngineLog.emit(
+                "[HLSVideoEngine] cached DemuxPlan ignored: duration \(String(format: "%.1f", candidate.durationSeconds))s vs \(String(format: "%.1f", durationSeconds))s (segments=\(candidate.segments.count))",
+                category: .session)
+            return nil
+        }
+        return candidate
+    }
 
     public func start() throws -> URL {
         guard demuxer == nil else { throw HLSVideoEngineError.alreadyStarted }
@@ -648,6 +695,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // list grows as the producer appends finalized segments.
         let durationSeconds = dem.duration
         let plan: [Segment]
+        /// The cached plan, when validation accepted it for this open.
+        var restoredPlan: DemuxPlan?
+        /// Whether a freshly built plan came from real indexed keyframes.
+        var planKeyframeAligned = false
         if isLiveSession {
             // Unbounded source. No duration guard, no prewarm seek, no
             // precomputed plan. The producer cuts segments live and the
@@ -666,6 +717,28 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 throw HLSVideoEngineError.zeroDuration
             }
             sourceBitrate = dem.bitRate
+
+            // Cached-plan shortcut (DemuxPlan): a validated plan from a
+            // previous open of the byte-identical file replaces steps 2-3
+            // below — no cue-prewarm seek (one or two Range reads against
+            // the file tail), no keyframe indexing, no plan construction.
+            if let cached = validatedDemuxPlan(for: dem, durationSeconds: durationSeconds) {
+                restoredPlan = cached
+                plan = cached.segments.map {
+                    Segment(startPts: $0.startPts, endPts: $0.endPts,
+                            startSeconds: $0.startSeconds,
+                            durationSeconds: $0.durationSeconds)
+                }
+                self.firstKeyframePts = cached.firstKeyframePts
+                self.firstKeyframeSeconds = cached.firstKeyframeSeconds
+                planKeyframeAligned = cached.keyframeAligned
+                EngineLog.emit(
+                    "[HLSVideoEngine] segment plan restored from cached DemuxPlan "
+                    + "(\(plan.count) segments, fileSize=\(cached.fileSize)) — "
+                    + "skipping cue prewarm + keyframe indexing",
+                    category: .session
+                )
+            } else {
 
             // 2. Prewarm the MKV cue table so libavformat's keyframe index
             //    is populated. avformat_seek_file's first invocation on an
@@ -694,6 +767,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     videoTimeBase: videoTimeBase,
                     sourceDurationSeconds: durationSeconds
                 )
+                planKeyframeAligned = true
                 let detectedFirstKeyframePts = keyframes.sorted().first ?? 0
                 self.firstKeyframePts = detectedFirstKeyframePts
                 let firstKeyframePts = detectedFirstKeyframePts
@@ -718,6 +792,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     category: .session
                 )
             }
+            } // end cached-plan else (fresh prewarm + plan build)
         }
 
         // 4. Classify the DV variant + dispatch codec / CODECS /
@@ -762,14 +837,22 @@ public final class HLSVideoEngine: @unchecked Sendable {
         //    entry and the item fails with CoreMediaErrorDomain -4.
         //    Reads consume packets; the seek-to-0 below resets the
         //    cursor for the producer pump.
-        let hevcExtradataOverride = rebuildHEVCExtradataWithInBandParameterSets(
-            demuxer: dem,
-            videoStreamIndex: videoIndex,
-            codecpar: codecpar
-        )
+        let hevcExtradataOverride: [UInt8]?
+        if let restoredPlan {
+            // The cached plan carries the rebuild's result (nil = the
+            // source never needed one), so the packet-consuming scan is
+            // skipped along with the prewarm.
+            hevcExtradataOverride = restoredPlan.hevcExtradataOverride.map { [UInt8]($0) }
+        } else {
+            hevcExtradataOverride = rebuildHEVCExtradataWithInBandParameterSets(
+                demuxer: dem,
+                videoStreamIndex: videoIndex,
+                codecpar: codecpar
+            )
+        }
         if let rebuilt = hevcExtradataOverride {
             EngineLog.emit(
-                "[HLSVideoEngine] rebuilt hvcC with in-band parameter sets: "
+                "[HLSVideoEngine] \(restoredPlan != nil ? "restored" : "rebuilt") hvcC with in-band parameter sets: "
                 + "\(codecpar.pointee.extradata_size) B → \(rebuilt.count) B",
                 category: .session
             )
@@ -784,6 +867,26 @@ public final class HLSVideoEngine: @unchecked Sendable {
         //    the producer's read cursor on the loopback feed).
         if !isLiveSession {
             dem.seek(to: 0)
+        }
+
+        // Export the derived per-file state for host-side persistence —
+        // the restored plan round-trips unchanged; a fresh build is
+        // serialized as computed. Sources without a probed byte size
+        // (local files, custom readers) export nothing: there is no
+        // byte-identity key a future open could validate against.
+        if !isLiveSession, dem.sourceFileSize > 0 {
+            producedDemuxPlan = restoredPlan ?? DemuxPlan(
+                fileSize: dem.sourceFileSize,
+                durationSeconds: durationSeconds,
+                segments: plan.map {
+                    DemuxPlan.PlanSegment(startPts: $0.startPts, endPts: $0.endPts,
+                                          startSeconds: $0.startSeconds,
+                                          durationSeconds: $0.durationSeconds)
+                },
+                firstKeyframePts: firstKeyframePts,
+                firstKeyframeSeconds: firstKeyframeSeconds,
+                hevcExtradataOverride: hevcExtradataOverride.map { Data($0) },
+                keyframeAligned: planKeyframeAligned)
         }
 
         // 6. Build the segment cache + producer. The producer's

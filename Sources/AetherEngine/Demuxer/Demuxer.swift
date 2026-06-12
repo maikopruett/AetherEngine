@@ -108,6 +108,13 @@ public final class Demuxer: @unchecked Sendable {
         avioProvider?.cumulativeBytesFetched ?? 0
     }
 
+    /// Source byte size from the AVIO reader's open-time Range/HEAD
+    /// probe. -1 for local files, custom readers, and live sources —
+    /// callers treating this as a byte-identity key must require > 0.
+    var sourceFileSize: Int64 {
+        (avioProvider as? AVIOReader)?.probedFileSize ?? -1
+    }
+
     /// Whether the opened source supports seeking. Forward-only custom
     /// sources report false; URL sources and unopened demuxers report true.
     var isSourceSeekable: Bool {

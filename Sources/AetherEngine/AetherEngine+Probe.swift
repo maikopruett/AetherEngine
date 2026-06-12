@@ -82,6 +82,65 @@ extension AetherEngine {
         makeSourceProbe(demuxer: demuxer, displayURL: url)
     }
 
+    // MARK: - Shared source network session
+
+    /// The long-lived URLSession backing the engine's file-size probes
+    /// (see `AVIOReader.probeSession`). Hosts that run their own
+    /// pre-flight reads against the source host — an availability verify,
+    /// a Range sniff — should issue them through this session: the DNS
+    /// lookup, TCP connection, and TLS session those reads establish then
+    /// directly warm the pool the engine's own open-time probe uses,
+    /// instead of the engine paying a fresh dial to a host the app
+    /// touched moments earlier. Keeping one TLS fingerprint also avoids
+    /// tripping Cloudflare-fronted origins that flag fingerprint churn.
+    public nonisolated static var sourceProbeSession: URLSession {
+        AVIOReader.probeSession
+    }
+
+    // MARK: - Preferred-language audio resolution
+
+    /// Resolve `LoadOptions.preferredAudioLanguage` into a concrete
+    /// stream override, given the probed track list and the index
+    /// `av_find_best_stream` would pick. Conservative on purpose (see
+    /// the option's doc): only diverts when the would-be default is
+    /// EXPLICITLY labeled a language that doesn't match the preference
+    /// and a matching track exists. Returns nil for "no override" —
+    /// the engine then keeps its auto pick.
+    nonisolated static func audioStreamOverride(
+        preferredLanguage: String,
+        tracks: [TrackInfo],
+        defaultIndex: Int32
+    ) -> Int32? {
+        guard tracks.count > 1 else { return nil }
+        let active = tracks.first(where: { Int32($0.id) == defaultIndex })
+            ?? tracks.first(where: \.isDefault)
+            ?? tracks.first
+        guard let active,
+              let activeLanguage = active.language, !activeLanguage.isEmpty,
+              !languageMatches(activeLanguage, preferredLanguage)
+        else { return nil }
+        guard let match = tracks.first(where: {
+            languageMatches($0.language ?? "", preferredLanguage)
+        }) else { return nil }
+        return Int32(match.id)
+    }
+
+    /// Loose language-code equality: exact match, region-tag prefix
+    /// ("en" vs "en-US"), or same alpha-2 mapping so the ISO 639-2
+    /// codes containers actually carry ("eng", "deu"/"ger") match the
+    /// 639-1 form a host naturally passes ("en", "de").
+    nonisolated static func languageMatches(_ trackLanguage: String, _ preferred: String) -> Bool {
+        let track = trackLanguage.lowercased()
+        let wanted = preferred.lowercased()
+        guard !track.isEmpty, !wanted.isEmpty else { return false }
+        if track == wanted { return true }
+        if track.hasPrefix(wanted + "-") || wanted.hasPrefix(track + "-") { return true }
+        let trackAlpha2 = Locale.LanguageCode(track).identifier(.alpha2)
+        let wantedAlpha2 = Locale.LanguageCode(wanted).identifier(.alpha2)
+        if let trackAlpha2, let wantedAlpha2 { return trackAlpha2 == wantedAlpha2 }
+        return false
+    }
+
     /// Assemble a `SourceProbe` from an open demuxer. Shared by the
     /// static probe entry points and `load(source:)`'s internal probe
     /// stage, so all of them report identical metadata for the same

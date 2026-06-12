@@ -196,6 +196,7 @@ extension AetherEngine {
         isLive: Bool = false,
         dvrWindowSeconds: Double? = nil,
         preopenedDemuxer: Demuxer? = nil,
+        demuxPlan: DemuxPlan? = nil,
         generation: UInt64
     ) async throws {
         // Upstream cadence hint for ingest sessions (nil for URL sources).
@@ -222,7 +223,8 @@ extension AetherEngine {
             dvrWindowSeconds: dvrWindowSeconds,
             liveSourceCadenceHint: liveSourceCadenceHint,
             preopenedDemuxer: preopenedDemuxer,
-            sourceReopenableByURL: !isCustomSource
+            sourceReopenableByURL: !isCustomSource,
+            demuxPlan: demuxPlan
         )
         session.onFirstHDR10PlusDetected = { [weak self] in
             Task { @MainActor in self?.handleHDR10PlusDetected() }
