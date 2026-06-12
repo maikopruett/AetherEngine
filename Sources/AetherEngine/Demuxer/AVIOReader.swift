@@ -324,6 +324,14 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// No bytes delivered for this long on a live connection means the CDN
     /// stalled the socket; treat it as a drop and reconnect.
     private static let connStallTimeout: TimeInterval = 20
+    /// Shorter patience for a (re)connection that has NEVER delivered a
+    /// byte: mid-stream pauses deserve the full stall window, but a fresh
+    /// GET that produces nothing is almost always a dead socket — observed
+    /// on RD seek-reconnects eating the whole 20s before retrying, while a
+    /// healthy dial's first byte lands in 0.7-6.5s. VOD only: Range re-GETs
+    /// are idempotent there, whereas re-GETting a slow-starting live
+    /// transcode can restart it server-side (Jellyfin spin-up ~15-20s).
+    private static let connFirstByteTimeout: TimeInterval = 8
     /// A reconnect that delivers at least this much before failing again
     /// counts as progress and clears the unproductive streak. Sized so a
     /// healthy stream (which delivers MB between real drops) always clears
@@ -854,9 +862,14 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 // Live connection streaming toward the cursor: wait for it to
                 // fill forward. NSCondition.wait releases the lock while
                 // blocked and re-acquires before returning; a false return
-                // means the connStallTimeout elapsed with no state change,
-                // i.e. a socket stall — treat it as a drop and reconnect.
-                let signaled = winCond.wait(until: Date(timeIntervalSinceNow: Self.connStallTimeout))
+                // means the timeout elapsed with no state change, i.e. a
+                // socket stall — treat it as a drop and reconnect. A VOD
+                // connection that has never delivered a byte gets the short
+                // first-byte window instead of the full stall patience.
+                let timeout = (genBytes == 0 && !isLive)
+                    ? Self.connFirstByteTimeout
+                    : Self.connStallTimeout
+                let signaled = winCond.wait(until: Date(timeIntervalSinceNow: timeout))
                 winCond.unlock()
                 if !signaled {
                     if recordReconnectAndShouldGiveUp() {
