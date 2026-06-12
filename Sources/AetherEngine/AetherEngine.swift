@@ -888,6 +888,23 @@ public final class AetherEngine: ObservableObject {
         // When present we adopt it as the probe/session demuxer and skip the
         // open below. The caller is responsible for having opened it with
         // matching options (httpHeaders/isLive).
+        //
+        // Trust-but-verify: a handed demuxer whose open never actually
+        // succeeded (prewarm killed by a network error mid-open) must not
+        // short-circuit the probe stage — its empty stream table reads as
+        // "no video" and dispatches the load to the audio-only path, which
+        // then dies with noAudioStream. Discard it and open fresh.
+        let preopenedDemuxer: Demuxer? = {
+            guard let handed = preopenedDemuxer else { return nil }
+            guard handed.isOpen else {
+                EngineLog.emit(
+                    "[AetherEngine] preopened demuxer is not open (prewarm open failed?) — discarding, opening fresh",
+                    category: .engine)
+                handed.close()
+                return nil
+            }
+            return handed
+        }()
         let probe = preopenedDemuxer ?? Demuxer()
         // Register the in-flight probe so stopInternal can abort it. The
         // probe's avformat_open_input / find_stream_info can block for the

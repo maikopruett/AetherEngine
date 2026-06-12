@@ -26,6 +26,12 @@ public final class DemuxerPrewarm: @unchecked Sendable {
     private var aborted = false
     private var taken = false
     private var opening = false
+    /// Set only when `open()` returned without throwing. `takeDemuxer()`
+    /// requires it: handing over a demuxer whose open FAILED (network
+    /// error mid-prewarm) used to make `load` adopt a stream-less
+    /// AVFormatContext and die with `noAudioStream` instead of falling
+    /// back to a fresh open.
+    private var openSucceeded = false
 
     /// Open it with the SAME `options` the eventual `load` will use
     /// (`httpHeaders`, `isLive`): the demuxer is reused as the session
@@ -60,15 +66,19 @@ public final class DemuxerPrewarm: @unchecked Sendable {
             if closeNow { demuxer.close() }
         }
         try demuxer.open(url: url, extraHeaders: options.httpHeaders, isLive: options.isLive)
+        lock.lock()
+        openSucceeded = true
+        lock.unlock()
     }
 
     /// Transfer the opened demuxer to a `load(preopenedDemuxer:)` call,
     /// transferring ownership (the engine closes it when the session ends).
-    /// Returns nil if `abort()` was called or it was already taken — the
-    /// caller then loads normally (the engine opens its own demuxer).
+    /// Returns nil if `abort()` was called, it was already taken, or the
+    /// open failed/never ran — the caller then loads normally (the engine
+    /// opens its own demuxer).
     public func takeDemuxer() -> Demuxer? {
         lock.lock(); defer { lock.unlock() }
-        guard !aborted, !taken else { return nil }
+        guard !aborted, !taken, openSucceeded else { return nil }
         taken = true
         return demuxer
     }

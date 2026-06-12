@@ -115,6 +115,11 @@ public final class Demuxer: @unchecked Sendable {
         (avioProvider as? AVIOReader)?.probedFileSize ?? -1
     }
 
+    /// Whether an open succeeded and the format context is live. Callers
+    /// adopting a demuxer they didn't open themselves (prewarm handoff)
+    /// must check this before trusting its stream table.
+    var isOpen: Bool { formatContext != nil }
+
     /// Whether the opened source supports seeking. Forward-only custom
     /// sources report false; URL sources and unopened demuxers report true.
     var isSourceSeekable: Bool {
