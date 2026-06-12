@@ -337,8 +337,15 @@ extension AetherEngine {
     /// `nonisolated` so it is unit-testable without a `@MainActor`
     /// engine instance. The audio path is taken when the host explicitly
     /// requested it OR the probe found no video stream.
-    nonisolated static func shouldUseAudioOnlyPath(audioOnlyRequested: Bool, hasVideoStream: Bool) -> Bool {
-        audioOnlyRequested || !hasVideoStream
+    /// Auto-routing to the audio path requires the probe to have actually
+    /// OPENED and found no video. A probe that FAILED (transient network
+    /// garbage, server error page) must not read as "no video stream" —
+    /// that used to route movies into AudioPlaybackHost, which reopened
+    /// the URL, found no audio either, and killed the session with
+    /// noAudioStream/openFailed instead of letting the video dispatch
+    /// reopen fresh (URL sources are reopenable internally).
+    nonisolated static func shouldUseAudioOnlyPath(audioOnlyRequested: Bool, probeSucceeded: Bool, hasVideoStream: Bool) -> Bool {
+        audioOnlyRequested || (probeSucceeded && !hasVideoStream)
     }
 
     /// Whether AVPlayer/AVFoundation can natively decode this audio codec

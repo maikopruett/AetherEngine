@@ -1084,7 +1084,9 @@ public final class AetherEngine: ObservableObject {
         //     closes the probe; the FFmpeg sub-branch reuses the probe
         //     demuxer (required for custom sources, which have no URL).
         let hasVideoStream = probeOpened && probe.videoStreamIndex >= 0
-        if Self.shouldUseAudioOnlyPath(audioOnlyRequested: options.audioOnly, hasVideoStream: hasVideoStream) {
+        if Self.shouldUseAudioOnlyPath(audioOnlyRequested: options.audioOnly,
+                                       probeSucceeded: probeOpened,
+                                       hasVideoStream: hasVideoStream) {
             // Read the chosen audio stream's codec before closing the probe
             // so AVPlayer-decodable audio takes the native path.
             let audioCodecID: AVCodecID = (probeOpened && resolvedInitialAudio >= 0)
