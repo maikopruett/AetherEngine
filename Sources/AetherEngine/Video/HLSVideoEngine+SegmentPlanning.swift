@@ -298,4 +298,41 @@ extension HLSVideoEngine {
         codecpar.pointee.codec_tag = 0
         return true
     }
+
+    /// Whether an AAC AudioSpecificConfig declares channelConfiguration = 0,
+    /// i.e. the channel layout is carried by an in-band Program Config
+    /// Element instead of one of the standard configurations. FFmpeg's
+    /// native AAC encoder emits this for layouts outside the standard table
+    /// (typically 5.1(side)), so release-group surround conversions carry
+    /// it. AudioToolbox cannot decode PCE-configured AAC: stream-copied
+    /// into the fMP4 it fails the WHOLE item with AVFoundationErrorDomain
+    /// -11829 'Cannot Open' / CoreMediaErrorDomain -12848 before the first
+    /// frame (device repro 2026-06-12: "Spirited Away [WeSLeY]", 5.1 AAC by
+    /// Lavc62). Such tracks must take the FLAC bridge.
+    static func aacASCUsesPCE(_ codecpar: UnsafePointer<AVCodecParameters>) -> Bool {
+        guard codecpar.pointee.codec_id == AV_CODEC_ID_AAC,
+              let extradata = codecpar.pointee.extradata,
+              codecpar.pointee.extradata_size >= 2 else { return false }
+        let bitCount = Int(codecpar.pointee.extradata_size) * 8
+        var bitPos = 0
+        func read(_ n: Int) -> Int? {
+            guard bitPos + n <= bitCount else { return nil }
+            var value = 0
+            for _ in 0..<n {
+                value = (value << 1) | Int((extradata[bitPos >> 3] >> (7 - UInt8(bitPos & 7))) & 1)
+                bitPos += 1
+            }
+            return value
+        }
+        guard let aot = read(5) else { return false }
+        if aot == 31 {  // escape: extended audioObjectType follows
+            guard read(6) != nil else { return false }
+        }
+        guard let freqIdx = read(4) else { return false }
+        if freqIdx == 15 {  // escape: explicit 24-bit sample rate follows
+            guard read(24) != nil else { return false }
+        }
+        guard let chanConfig = read(4) else { return false }
+        return chanConfig == 0
+    }
 }

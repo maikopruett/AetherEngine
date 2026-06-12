@@ -1065,14 +1065,23 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 && (acpForHE.profile == 4        // FF_PROFILE_AAC_HE
                     || acpForHE.profile == 28    // FF_PROFILE_AAC_HE_V2
                     || acpForHE.frame_size == 2048)
-            if compat.requiresBridge || isHEAAC {
+            // AAC whose ASC declares channelConfiguration = 0 carries its
+            // channel map in an in-band PCE. AudioToolbox can't decode
+            // that; stream-copied it fails the whole item with -11829
+            // 'Cannot Open' / CoreMediaErrorDomain -12848 before the first
+            // frame. See `aacASCUsesPCE`.
+            let isPCEAAC = Self.aacASCUsesPCE(audioStream.pointee.codecpar)
+            if compat.requiresBridge || isHEAAC || isPCEAAC {
                 bridgePreferred = true
-                EngineLog.emit(
-                    isHEAAC
-                        ? "[HLSVideoEngine] audio: HE-AAC (profile=\(acpForHE.profile) frameSize=\(acpForHE.frame_size)), ADTS stream-copy would mis-signal SBR, bridging instead"
-                        : "[HLSVideoEngine] audio: codec=\(compat) (bridge required), decoding + FLAC re-encode",
-                    category: .session
-                )
+                let bridgeReason: String
+                if isHEAAC {
+                    bridgeReason = "HE-AAC (profile=\(acpForHE.profile) frameSize=\(acpForHE.frame_size)), ADTS stream-copy would mis-signal SBR, bridging instead"
+                } else if isPCEAAC {
+                    bridgeReason = "AAC with PCE channel config (channelConfiguration=0, \(acpForHE.ch_layout.nb_channels)ch), AudioToolbox can't decode PCE, bridging instead"
+                } else {
+                    bridgeReason = "codec=\(compat) (bridge required), decoding + FLAC re-encode"
+                }
+                EngineLog.emit("[HLSVideoEngine] audio: \(bridgeReason)", category: .session)
             } else if compat != .unsupported {
                 // ADTS-AAC from MPEG-TS carries no AudioSpecificConfig in
                 // extradata, so the fMP4 mp4a/esds sample entry can't be built
