@@ -77,6 +77,15 @@ public final class Demuxer: @unchecked Sendable {
     /// (HTTP via AVIOReader, custom via CustomIOReaderBridge).
     private var avioProvider: AVIOProvider?
 
+    /// Sticky record that `markClosed()` was called, so an open that is
+    /// still wiring up its AVIO provider (HEAD probe in flight, provider
+    /// not yet assigned) observes a concurrent markClosed instead of losing
+    /// it to the assignment race and reading to completion. Set only by
+    /// `markClosed()` — never by `close()`, whose direct provider unblock
+    /// must not poison the fast-probe re-open inside `open()`.
+    private var markedClosed = false
+    private let markLock = NSLock()
+
     /// Profile supplied to the most recent `open` call. Governs probe
     /// budget in `applyProbeBudget` and (in a later task) AVIO tuning.
     private var openProfile: DemuxerOpenProfile = .playback
@@ -251,6 +260,14 @@ public final class Demuxer: @unchecked Sendable {
         // 1. Open the provider (HEAD probe for HTTP, alloc context for custom).
         try provider.open()
         avioProvider = provider
+
+        // A markClosed() that raced this assignment found avioProvider nil
+        // and couldn't reach the reader — re-deliver it so the abort still
+        // kills the open at the first AVIO read.
+        markLock.lock()
+        let closedWhileOpening = markedClosed
+        markLock.unlock()
+        if closedWhileOpening { provider.markClosed() }
 
         // 2. Allocate an empty AVFormatContext and attach the provider's AVIO.
         guard let ctx = avformat_alloc_context() else {
@@ -798,6 +815,9 @@ public final class Demuxer: @unchecked Sendable {
     /// the pump can unwind without waiting on the (potentially slow) `close()`
     /// teardown. Idempotent; `close()` calls it again before freeing.
     func markClosed() {
+        markLock.lock()
+        markedClosed = true
+        markLock.unlock()
         avioProvider?.markClosed()
     }
 

@@ -25,6 +25,7 @@ public final class DemuxerPrewarm: @unchecked Sendable {
     private let lock = NSLock()
     private var aborted = false
     private var taken = false
+    private var opening = false
 
     /// Open it with the SAME `options` the eventual `load` will use
     /// (`httpHeaders`, `isLive`): the demuxer is reused as the session
@@ -38,6 +39,26 @@ public final class DemuxerPrewarm: @unchecked Sendable {
     /// main actor. Throws if the open fails or `abort()` unblocked it; the
     /// caller can ignore the throw and rely on `takeDemuxer()` returning nil.
     public func open() throws {
+        lock.lock()
+        if aborted || taken {
+            lock.unlock()
+            throw CancellationError()
+        }
+        opening = true
+        lock.unlock()
+
+        // When abort() lands mid-open it only UNBLOCKS the open (markClosed);
+        // the teardown happens here, after FFmpeg has fully unwound. Freeing
+        // the AVFormatContext / AVIO buffers from the aborting thread while
+        // avformat_open_input was still inside them was a use-after-free
+        // (EXC_BAD_ACCESS when a new prewarm superseded an in-flight one).
+        defer {
+            lock.lock()
+            opening = false
+            let closeNow = aborted
+            lock.unlock()
+            if closeNow { demuxer.close() }
+        }
         try demuxer.open(url: url, extraHeaders: options.httpHeaders, isLive: options.isLive)
     }
 
@@ -52,17 +73,23 @@ public final class DemuxerPrewarm: @unchecked Sendable {
         return demuxer
     }
 
-    /// Abort an in-flight open and free the demuxer. After this,
-    /// `takeDemuxer()` returns nil. No-op once the demuxer has been taken
-    /// (ownership already transferred to a load). Idempotent, any thread.
+    /// Abort an in-flight open. After this, `takeDemuxer()` returns nil.
+    /// No-op once the demuxer has been taken (ownership already transferred
+    /// to a load). Idempotent, any thread.
     public func abort() {
         lock.lock()
         if taken || aborted { lock.unlock(); return }
         aborted = true
+        let openInFlight = opening
         lock.unlock()
         // markClosed() makes a blocked avformat_open_input / find_stream_info
-        // return -1 at once; close() frees the context.
+        // return -1 at once. It frees nothing, so it's the only call that's
+        // safe while another thread is still inside the open.
         demuxer.markClosed()
-        demuxer.close()
+        // Free the demuxer only when no open owns it; an in-flight open's
+        // defer performs the close after FFmpeg returns (see open()).
+        if !openInFlight {
+            demuxer.close()
+        }
     }
 }
