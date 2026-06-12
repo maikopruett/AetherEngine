@@ -82,6 +82,18 @@ extension AetherEngine {
         makeSourceProbe(demuxer: demuxer, displayURL: url)
     }
 
+    // MARK: - Linked FFmpeg identity
+
+    /// The configure line baked into the linked libavformat (e.g.
+    /// "--enable-static ... --enable-zlib ..."). Changes whenever the
+    /// FFmpegBuild binaries change capabilities, so hosts can use it to
+    /// scope capability-dependent caches — e.g. an "engine couldn't open
+    /// this file" blocklist that must reset when a new FFmpeg build can
+    /// suddenly open those files.
+    public nonisolated static var ffmpegConfiguration: String {
+        String(cString: avformat_configuration())
+    }
+
     // MARK: - Shared source network session
 
     /// The long-lived URLSession backing the engine's file-size probes
