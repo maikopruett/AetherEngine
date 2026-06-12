@@ -64,6 +64,24 @@ extension AetherEngine {
         return makeSourceProbe(demuxer: demuxer, displayURL: displayURL)
     }
 
+    /// `probe(url:)` against a demuxer the caller already opened — e.g. a
+    /// `DemuxerPrewarm` handle about to be handed to
+    /// `load(preopenedDemuxer:)`. Assembles the same `SourceProbe` from the
+    /// metadata that open already gathered: no network I/O, no read-cursor
+    /// movement, and the demuxer stays open and fully usable afterwards.
+    ///
+    /// This is how a host that prewarmed the open should inspect tracks
+    /// (e.g. pick an audio stream for `load(audioSourceStreamIndex:)`):
+    /// for a big remote MKV, `probe(url:)` would re-open the container —
+    /// header fetch, cue-index seeks at the far end of the file, fresh
+    /// CDN connections — and pay tens of seconds the prewarm already paid.
+    ///
+    /// `url` feeds `SourceProbe.url` and the live-stream heuristic only;
+    /// pass the URL the demuxer was opened with.
+    public nonisolated static func probe(openDemuxer demuxer: Demuxer, url: URL) -> SourceProbe {
+        makeSourceProbe(demuxer: demuxer, displayURL: url)
+    }
+
     /// Assemble a `SourceProbe` from an open demuxer. Shared by the
     /// static probe entry points and `load(source:)`'s internal probe
     /// stage, so all of them report identical metadata for the same
