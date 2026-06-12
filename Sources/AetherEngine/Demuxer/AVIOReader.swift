@@ -363,6 +363,15 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private var connGeneration = 0
     private var activeSession: URLSession?
     private var activeTask: URLSessionDataTask?
+    /// Connection diagnostics: dial time of the current generation, whether
+    /// its first-byte latency has been logged, and bytes it has delivered.
+    /// Pins down where a slow container open spends its time — dial/first-
+    /// byte latency vs body bytes streamed (e.g. a 30 MB attachment blob
+    /// between an MKV's header and first cluster). Guarded by winCond.
+    private var genDialedAt = Date()
+    private var genSawFirstByte = false
+    private var genBytes: Int64 = 0
+
     /// Consecutive UNPRODUCTIVE reconnects (each delivered less than
     /// `minReconnectProgress` before failing again). Reset to 0 on any real
     /// progress. A genuinely flaky link that still streams MB between drops
@@ -996,6 +1005,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         winCond.lock()
         connGeneration &+= 1
         let generation = connGeneration
+        #if DEBUG
+        let prevGenKB = genBytes / 1024
+        #endif
+        genBytes = 0
+        genSawFirstByte = false
         winStart = offset
         window = Data()
         connEnded = false
@@ -1042,11 +1056,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         }
         activeSession = session
         activeTask = task
+        genDialedAt = Date()
         winCond.unlock()
 
         task.resume()
         #if DEBUG
-        EngineLog.emit("[AVIOReader] Persistent conn start gen=\(generation) offset=\(offset)", category: .demux)
+        EngineLog.emit("[AVIOReader] Persistent conn start gen=\(generation) offset=\(offset) (prev gen delivered \(prevGenKB)KB)", category: .demux)
         #endif
     }
 
@@ -1078,6 +1093,14 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             }
         }
         addBytesFetched(count)
+        #if DEBUG
+        var firstByteMs: Int?
+        if !genSawFirstByte {
+            genSawFirstByte = true
+            firstByteMs = Int(Date().timeIntervalSince(genDialedAt) * 1000)
+        }
+        #endif
+        genBytes += Int64(count)
         winCond.broadcast()   // wake a reader waiting for forward data
 
         // Backpressure: wait on the condition (which releases the lock while
@@ -1091,6 +1114,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             _ = winCond.wait(until: Date(timeIntervalSinceNow: 0.2))
         }
         winCond.unlock()
+
+        #if DEBUG
+        if let firstByteMs {
+            EngineLog.emit("[AVIOReader] gen=\(generation) first byte after \(firstByteMs)ms", category: .demux)
+        }
+        #endif
     }
 
     /// Delegate callback: response headers arrived. Captures the status,

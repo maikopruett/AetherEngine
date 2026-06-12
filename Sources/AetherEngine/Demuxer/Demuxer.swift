@@ -137,7 +137,7 @@ public final class Demuxer: @unchecked Sendable {
             self.openProfile = .fastProbe
             try openByScheme(url: url, extraHeaders: extraHeaders, isLive: isLive)
             guard hasPlayableStreamMissingParameters() else {
-                EngineLog.emit("[Demuxer] open+probe took \(Self.elapsedMs(since: start))ms (fast probe)", category: .demux)
+                EngineLog.emit("[Demuxer] open+probe took \(Self.elapsedMs(since: start))ms (fast probe, fetched \(Self.mbString(avioBytesFetched))MB)", category: .demux)
                 return
             }
             EngineLog.emit("[Demuxer] fast probe left a playable stream without codec parameters after \(Self.elapsedMs(since: start))ms — re-opening with full probe budget", category: .demux)
@@ -146,7 +146,11 @@ public final class Demuxer: @unchecked Sendable {
 
         self.openProfile = profile
         try openByScheme(url: url, extraHeaders: extraHeaders, isLive: isLive)
-        EngineLog.emit("[Demuxer] open+probe took \(Self.elapsedMs(since: start))ms (full budget)", category: .demux)
+        EngineLog.emit("[Demuxer] open+probe took \(Self.elapsedMs(since: start))ms (full budget, fetched \(Self.mbString(avioBytesFetched))MB)", category: .demux)
+    }
+
+    private static func mbString(_ bytes: Int64) -> String {
+        String(format: "%.1f", Double(bytes) / 1_048_576)
     }
 
     private func openByScheme(url: URL, extraHeaders: [String: String], isLive: Bool) throws {
