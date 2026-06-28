@@ -1073,13 +1073,14 @@ public final class HLSVideoEngine: @unchecked Sendable {
             let isPCEAAC = Self.aacASCUsesPCE(audioStream.pointee.codecpar)
             if compat.requiresBridge || isHEAAC || isPCEAAC {
                 bridgePreferred = true
+                let bridgeCodec = audioBridgeMode == .surroundCompat ? "EAC3" : "FLAC"
                 let bridgeReason: String
                 if isHEAAC {
                     bridgeReason = "HE-AAC (profile=\(acpForHE.profile) frameSize=\(acpForHE.frame_size)), ADTS stream-copy would mis-signal SBR, bridging instead"
                 } else if isPCEAAC {
                     bridgeReason = "AAC with PCE channel config (channelConfiguration=0, \(acpForHE.ch_layout.nb_channels)ch), AudioToolbox can't decode PCE, bridging instead"
                 } else {
-                    bridgeReason = "codec=\(compat) (bridge required), decoding + FLAC re-encode"
+                    bridgeReason = "codec=\(compat) (bridge required), decoding + \(bridgeCodec) re-encode"
                 }
                 EngineLog.emit("[HLSVideoEngine] audio: \(bridgeReason)", category: .session)
             } else if compat != .unsupported {

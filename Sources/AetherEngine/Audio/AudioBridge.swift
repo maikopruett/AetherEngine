@@ -122,13 +122,13 @@ final class AudioBridge: @unchecked Sendable {
     private let pcmBytesPerSample: Int32
     private let pcmBitsPerRawSample: Int32
 
-    /// AVCodecParameters describing the FLAC output stream. Caller
+    /// AVCodecParameters describing the encoded output stream. Caller
     /// hands this to `HLSSegmentProducer.AudioConfig.codecpar` and
     /// the producer installs it on the muxer's audio output stream.
     /// Owned by the bridge; freed in `close()`.
     private(set) var encoderCodecpar: UnsafeMutablePointer<AVCodecParameters>?
 
-    /// Time base of the FLAC output stream (1 / sample_rate). Caller
+    /// Time base of the encoded output stream (1 / sample_rate). Caller
     /// passes this as `StreamConfig.timeBase`.
     private(set) var encoderTimeBase: AVRational = AVRational(num: 1, den: 1)
 
@@ -150,6 +150,8 @@ final class AudioBridge: @unchecked Sendable {
     private var rebaseFromNextSourcePTS: Bool = false
 
     private static let avNoPTS: Int64 = -0x7FFFFFFFFFFFFFFF - 1
+    private static let fallbackSampleRate: Int32 = 48_000
+    private static let eac3SampleRates: [Int32] = [48_000, 44_100, 32_000]
 
     // MARK: - Lifecycle
 
@@ -163,8 +165,10 @@ final class AudioBridge: @unchecked Sendable {
     /// Encoder is opened eagerly so `encoderCodecpar` is available
     /// immediately for muxer init. If the source's codecpar is
     /// incomplete (TrueHD sometimes reports `sample_rate=0` until the
-    /// first frame), we fall back to 48 kHz stereo, which the resampler
-    /// will reconfigure on the first decoded frame if it differs.
+    /// first frame), we fall back to 48 kHz stereo. In surround-compat
+    /// mode, high-resolution sources are resampled to an EAC3-supported
+    /// encoder rate (48 / 44.1 / 32 kHz) instead of opening the encoder
+    /// at the source rate.
     init(
         srcCodecpar: UnsafeMutablePointer<AVCodecParameters>,
         srcTimeBase: AVRational,
@@ -258,9 +262,13 @@ final class AudioBridge: @unchecked Sendable {
         }
         encoderCtx = enc
 
-        let sampleRate: Int32 = srcCodecpar.pointee.sample_rate > 0
+        let sourceSampleRate: Int32 = srcCodecpar.pointee.sample_rate > 0
             ? srcCodecpar.pointee.sample_rate
-            : 48000
+            : Self.fallbackSampleRate
+        let encoderSampleRate = Self.encoderSampleRate(
+            forSourceSampleRate: sourceSampleRate,
+            mode: mode
+        )
 
         // Channel-count resolution. Try sources in order:
         //   1. srcCodecpar.ch_layout — populated by the demuxer from the
@@ -313,14 +321,15 @@ final class AudioBridge: @unchecked Sendable {
             : "VBR"
         EngineLog.emit(
             "[AudioBridge] init: mode=\(mode.rawValue) "
-            + "srcCodec=\(srcCodecID.rawValue) sampleRate=\(sampleRate) "
+            + "srcCodec=\(srcCodecID.rawValue) "
+            + "sourceSampleRate=\(sourceSampleRate) encoderSampleRate=\(encoderSampleRate) "
             + "sourceChannels=\(resolvedChannels) "
             + "encoderChannels=\(nChannels) bitRate=\(logBitRate) "
             + "(source=\(resolvedSource), container=\(containerChannels), decoder=\(decoderChannels))",
             category: .session
         )
 
-        enc.pointee.sample_rate = sampleRate
+        enc.pointee.sample_rate = encoderSampleRate
         enc.pointee.sample_fmt = pcmSampleFmt
         enc.pointee.bits_per_raw_sample = pcmBitsPerRawSample
         // Dynamic per-channel bitrate for the EAC3 path (128 kbps per
@@ -334,7 +343,7 @@ final class AudioBridge: @unchecked Sendable {
             resolvedBitRate = 0
         }
         enc.pointee.bit_rate = resolvedBitRate
-        enc.pointee.time_base = AVRational(num: 1, den: sampleRate)
+        enc.pointee.time_base = AVRational(num: 1, den: encoderSampleRate)
         var encLayout = AVChannelLayout()
         av_channel_layout_default(&encLayout, nChannels)
         let layoutCopyRet = av_channel_layout_copy(&enc.pointee.ch_layout, &encLayout)
@@ -347,9 +356,9 @@ final class AudioBridge: @unchecked Sendable {
             cleanup()
             throw AudioBridgeError.encoderOpenFailed(code: encOpenRet)
         }
-        encoderTimeBase = AVRational(num: 1, den: sampleRate)
+        encoderTimeBase = AVRational(num: 1, den: encoderSampleRate)
 
-        // 3. Codecpar describing the FLAC output for the muxer.
+        // 3. Codecpar describing the encoded output for the muxer.
         guard let cp = avcodec_parameters_alloc() else {
             cleanup()
             throw AudioBridgeError.codecparAllocFailed
@@ -365,11 +374,10 @@ final class AudioBridge: @unchecked Sendable {
         //    sample_fmt if it's already populated (most lossy codecs
         //    fill it during avcodec_open2). For codecs that defer
         //    until the first decoded frame (TrueHD), seed with FLTP
-        //    and the resampler reconfigures on first feed if the real
-        //    layout differs.
+        //    and the resampler starts from the container rate fallback.
         let inFmtRaw = dec.pointee.sample_fmt.rawValue
         let inFmt = inFmtRaw >= 0 ? dec.pointee.sample_fmt : AV_SAMPLE_FMT_FLTP
-        let inRate = dec.pointee.sample_rate > 0 ? dec.pointee.sample_rate : sampleRate
+        let inRate = dec.pointee.sample_rate > 0 ? dec.pointee.sample_rate : sourceSampleRate
         var inLayout = AVChannelLayout()
         if dec.pointee.ch_layout.nb_channels > 0 {
             av_channel_layout_copy(&inLayout, &dec.pointee.ch_layout)
@@ -384,7 +392,7 @@ final class AudioBridge: @unchecked Sendable {
             &swrCtx,
             &enc.pointee.ch_layout,
             pcmSampleFmt,
-            sampleRate,
+            encoderSampleRate,
             &inLayout,
             inFmt,
             inRate,
@@ -408,12 +416,32 @@ final class AudioBridge: @unchecked Sendable {
         guard let fifoPtr = av_audio_fifo_alloc(
             pcmSampleFmt,
             nChannels,
-            sampleRate
+            encoderSampleRate
         ) else {
             cleanup()
             throw AudioBridgeError.encoderAllocFailed
         }
         fifo = fifoPtr
+    }
+
+    static func encoderSampleRate(forSourceSampleRate sourceSampleRate: Int32, mode: Mode) -> Int32 {
+        let sourceRate = sourceSampleRate > 0 ? sourceSampleRate : fallbackSampleRate
+        switch mode {
+        case .lossless:
+            return sourceRate
+        case .surroundCompat:
+            if eac3SampleRates.contains(sourceRate) {
+                return sourceRate
+            }
+            if sourceRate > fallbackSampleRate {
+                if sourceRate % 48_000 == 0 { return 48_000 }
+                if sourceRate % 44_100 == 0 { return 44_100 }
+                if sourceRate % 32_000 == 0 { return 32_000 }
+            }
+            return eac3SampleRates.min { lhs, rhs in
+                abs(Int(lhs) - Int(sourceRate)) < abs(Int(rhs) - Int(sourceRate))
+            } ?? fallbackSampleRate
+        }
     }
 
     deinit {
@@ -869,4 +897,3 @@ final class AudioBridge: @unchecked Sendable {
         }
     }
 }
-
